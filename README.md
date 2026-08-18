@@ -64,4 +64,25 @@ python collector/parse_game.py data/game-flows.jsonl data/match-candidates.jsonl
 pytest -q
 ```
 
+## Admin model configuration
+
+The model administration page is available at `/admij`. Configure these
+environment variables before starting FastAPI; the password and encryption
+key are intentionally not stored in the repository:
+
+```powershell
+$env:ADMIN_USERNAME = "admin"
+$env:ADMIN_PASSWORD = "replace-with-a-long-random-password"
+$env:ADMIN_SESSION_SECRET = "replace-with-a-long-random-session-secret"
+$env:ADMIN_ENCRYPTION_KEY = (python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
+$env:ADMIN_COOKIE_SECURE = "1" # use 1 when serving behind HTTPS
+python -m uvicorn api.app:app --host 0.0.0.0 --port 8000
+```
+
+After login, add any OpenAI-compatible Chat Completions endpoint (DeepSeek,
+Qwen, GPT, or a self-hosted service). API keys are encrypted in SQLite and
+the UI only shows whether a key is configured plus its final four characters.
+The public page reads `/api/v1/predictions` and updates through SSE; it never
+returns model URLs or keys.
+
 预测模块是贝叶斯平滑频率基线，只用于描述最近样本，不代表确定性预测。
