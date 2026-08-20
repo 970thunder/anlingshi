@@ -1,4 +1,6 @@
 import os
+import base64
+import json
 from pathlib import Path
 from datetime import datetime, timezone
 from cryptography.fernet import Fernet
@@ -49,3 +51,23 @@ def test_admin_login_and_encrypted_model_config(monkeypatch):
         assert model["key_configured"] is True
         assert model["key_suffix"] == "-key"
         assert "secret-api-key" not in response.text
+
+
+def test_paired_device_uploads_encrypted_credential(monkeypatch):
+    monkeypatch.setattr(app_module, "ADMIN_PASSWORD", "device-pass")
+    monkeypatch.setattr(app_module, "ADMIN_SESSION_SECRET", "session-secret")
+    monkeypatch.setattr(app_module, "ADMIN_ENCRYPTION_KEY", Fernet.generate_key().decode())
+    encoded = base64.urlsafe_b64encode(json.dumps({"exp": int(datetime.now(timezone.utc).timestamp()) + 3600}).encode()).decode().rstrip("=")
+    jwt = f"eyJhbGciOiJIUzI1NiJ9.{encoded}.signature"
+    with TestClient(app) as client:
+        assert client.get("/api/v1/admin/devices").status_code == 401
+        login = client.post("/api/v1/admin/login", json={"username": "admin", "password": "device-pass"})
+        csrf = login.json()["csrf_token"]
+        paired = client.post("/api/v1/admin/devices", headers={"X-CSRF-Token": csrf}, json={"name": "test-host"})
+        assert paired.status_code == 200
+        device = paired.json()["device"]
+        uploaded = client.post("/api/v1/device/credentials", headers={"X-Device-ID": device["device_id"], "X-Device-Token": paired.json()["pairing_token"]}, json={"jwt": jwt})
+        assert uploaded.status_code == 200
+        with app_module.connect() as db:
+            stored = db.execute("SELECT jwt_ciphertext FROM collector_credentials WHERE device_id=?", (device["device_id"],)).fetchone()[0]
+        assert jwt not in stored

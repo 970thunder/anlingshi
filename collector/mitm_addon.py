@@ -17,6 +17,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import requests
 from mitmproxy import ctx, http
+from collector.game_protocol import extract_candidate
 
 TARGET_HOSTS = {h.strip().lower() for h in os.getenv("TARGET_HOSTS", "").split(",") if h.strip()}
 POST_URL = os.getenv("POST_URL", "http://127.0.0.1:8000/api/v1/results")
@@ -26,9 +27,6 @@ CANDIDATE_PATH = Path(os.getenv("CANDIDATE_LOG", "data/match-candidates.jsonl"))
 RAW_PATH.parent.mkdir(parents=True, exist_ok=True)
 CANDIDATE_PATH.parent.mkdir(parents=True, exist_ok=True)
 SECRET_KEYS = re.compile(r"(token|session|openid|authorization|cookie|secret|sign|password)", re.I)
-WINDOW_RE = re.compile(rb"(20\d\d-\d\d-\d\d \d\d:\d\d:\d\d).{0,12}(20\d\d-\d\d-\d\d \d\d:\d\d:\d\d)")
-CODE_RE = re.compile(rb"\[([12])\]")
-ROUND_RE = re.compile(rb"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)")
 
 
 def redact(value: Any) -> Any:
@@ -90,16 +88,6 @@ CODE_SIDE = {
     1: normalize_side(os.getenv("RESULT_CODE_1", "blue")),
     2: normalize_side(os.getenv("RESULT_CODE_2", "red")),
 }
-
-
-def extract_candidate(payload: bytes, captured_at: str) -> dict[str, Any] | None:
-    window = WINDOW_RE.search(payload)
-    code = CODE_RE.search(payload)
-    if not window or not code:
-        return None
-    start, end = (value.decode("ascii") for value in window.groups())
-    rounds = [value.decode("ascii") for value in ROUND_RE.findall(payload)]
-    return {"captured_at": captured_at, "start_time": start, "end_time": end, "result_code": int(code.group(1)), "round_hint": rounds[-1] if rounds else None, "source": "anlingshiapi.mangqu.xin/wss"}
 
 
 def extract_result(payload: Any, flow_key: str) -> dict[str, Any] | None:

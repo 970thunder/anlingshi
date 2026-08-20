@@ -85,4 +85,29 @@ the UI only shows whether a key is configured plus its final four characters.
 The public page reads `/api/v1/predictions` and updates through SSE; it never
 returns model URLs or keys.
 
+## Desktop authorization refresh agent
+
+The server can collect settlements without an always-open mini-program while a
+valid game credential exists. Run the server-side listener alongside the API:
+
+```powershell
+$env:ADMIN_ENCRYPTION_KEY = "the same key used by FastAPI"
+$env:WRITE_TOKEN = "change-me-local"
+python -m collector.server_ws_client
+```
+
+In `/admij`, create an **authorized refresh device** and copy its one-time
+device ID and pairing token into the Windows desktop application:
+
+```powershell
+python collector/desktop_agent.py
+```
+
+The desktop agent uses the current Windows user's DPAPI to protect its pairing
+token. It starts a local proxy only when requested. The operator must manually
+open the authorized mini-program to refresh a login; the app captures the new
+JWT and uploads it immediately without writing the JWT to disk. The server
+then reconnects independently until the credential expires. Do not automate or
+attempt to bypass the platform login flow.
+
 预测模块是贝叶斯平滑频率基线，只用于描述最近样本，不代表确定性预测。

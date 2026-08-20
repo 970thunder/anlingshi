@@ -8,6 +8,7 @@ import re
 import secrets
 import sqlite3
 import time
+import base64
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -110,6 +111,22 @@ def init_db() -> None:
               detail TEXT,
               created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS collector_devices (
+              device_id TEXT PRIMARY KEY,
+              name TEXT NOT NULL,
+              token_hash TEXT NOT NULL,
+              enabled INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL,
+              last_seen_at TEXT,
+              last_credential_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS collector_credentials (
+              device_id TEXT PRIMARY KEY,
+              jwt_ciphertext TEXT NOT NULL,
+              expires_at TEXT NOT NULL,
+              captured_at TEXT NOT NULL,
+              FOREIGN KEY(device_id) REFERENCES collector_devices(device_id)
+            );
             CREATE TABLE IF NOT EXISTS prediction_batches (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               anchor_match_id INTEGER NOT NULL,
@@ -190,6 +207,15 @@ class ModelConfigIn(BaseModel):
     timeout_seconds: float = Field(default=15, ge=1, le=120)
 
 
+class CollectorDeviceIn(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+
+
+class CollectorCredentialIn(BaseModel):
+    jwt: str = Field(min_length=30, max_length=4096)
+    expires_at: datetime | None = None
+
+
 def normalize_winner(value: str) -> str:
     value = value.strip().lower()
     aliases = {"red": "red", "r": "red", "2": "red", "\u7ea2": "red", "blue": "blue", "b": "blue", "1": "blue", "\u84dd": "blue"}
@@ -232,6 +258,27 @@ def decrypt_key(value: str) -> str:
 
 def hash_session(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+def jwt_expiry(token: str) -> datetime:
+    """Read only the unsigned expiry claim; signature validation remains server-owned."""
+    try:
+        part = token.split(".")[1]
+        decoded = base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))
+        exp = json.loads(decoded)["exp"]
+        return datetime.fromtimestamp(int(exp), timezone.utc)
+    except (IndexError, KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid JWT expiry") from exc
+
+
+def device_auth(device_id: str | None, device_token: str | None) -> sqlite3.Row:
+    if not device_id or not device_token:
+        raise HTTPException(status_code=401, detail="device credentials required")
+    with connect() as db:
+        row = db.execute("SELECT * FROM collector_devices WHERE device_id=? AND enabled=1", (device_id,)).fetchone()
+    if row is None or not secrets.compare_digest(row["token_hash"], hash_session(device_token)):
+        raise HTTPException(status_code=401, detail="invalid device credentials")
+    return row
 
 
 def audit(action: str, model_name: str | None = None, detail: str | None = None) -> None:
@@ -690,6 +737,63 @@ def admin_audit(_: sqlite3.Row = Depends(admin_session), limit: int = Query(defa
     with connect() as db:
         rows = db.execute("SELECT action,model_name,detail,created_at FROM admin_audit_logs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     return {"items": [dict(row) for row in rows]}
+
+
+@app.get("/api/v1/admin/devices")
+def admin_devices(_: sqlite3.Row = Depends(admin_session)) -> dict[str, Any]:
+    with connect() as db:
+        rows = db.execute("SELECT d.device_id,d.name,d.enabled,d.created_at,d.last_seen_at,d.last_credential_at,c.expires_at,c.captured_at FROM collector_devices d LEFT JOIN collector_credentials c ON c.device_id=d.device_id ORDER BY d.created_at DESC").fetchall()
+    return {"items": [{**dict(row), "credential_active": bool(row["expires_at"] and row["expires_at"] > iso_now())} for row in rows]}
+
+
+@app.post("/api/v1/admin/devices")
+def admin_create_device(payload: CollectorDeviceIn, session: sqlite3.Row = Depends(admin_session), x_csrf_token: str | None = Header(default=None)) -> dict[str, Any]:
+    require_csrf(x_csrf_token, session)
+    device_id = secrets.token_urlsafe(12)
+    pairing_token = secrets.token_urlsafe(32)
+    with connect() as db:
+        db.execute("INSERT INTO collector_devices(device_id,name,token_hash,created_at) VALUES(?,?,?,?)", (device_id, payload.name, hash_session(pairing_token), iso_now()))
+    audit("device_create", device_id, payload.name)
+    return {"device": {"device_id": device_id, "name": payload.name}, "pairing_token": pairing_token}
+
+
+@app.delete("/api/v1/admin/devices/{device_id}")
+def admin_delete_device(device_id: str, session: sqlite3.Row = Depends(admin_session), x_csrf_token: str | None = Header(default=None)) -> dict[str, bool]:
+    require_csrf(x_csrf_token, session)
+    with connect() as db:
+        row = db.execute("SELECT name FROM collector_devices WHERE device_id=?", (device_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="device not found")
+        db.execute("DELETE FROM collector_credentials WHERE device_id=?", (device_id,))
+        db.execute("DELETE FROM collector_devices WHERE device_id=?", (device_id,))
+    audit("device_delete", device_id, row["name"])
+    return {"ok": True}
+
+
+@app.post("/api/v1/device/credentials")
+def device_upload_credential(payload: CollectorCredentialIn, x_device_id: str | None = Header(default=None), x_device_token: str | None = Header(default=None)) -> dict[str, Any]:
+    device = device_auth(x_device_id, x_device_token)
+    try:
+        expiry = jwt_expiry(payload.jwt)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if payload.expires_at and abs((payload.expires_at.astimezone(timezone.utc) - expiry).total_seconds()) > 300:
+        raise HTTPException(status_code=422, detail="JWT expiry does not match payload")
+    if expiry <= utc_now():
+        raise HTTPException(status_code=422, detail="JWT is expired")
+    ciphertext = encrypt_key(payload.jwt)
+    with connect() as db:
+        db.execute("INSERT INTO collector_credentials(device_id,jwt_ciphertext,expires_at,captured_at) VALUES(?,?,?,?) ON CONFLICT(device_id) DO UPDATE SET jwt_ciphertext=excluded.jwt_ciphertext,expires_at=excluded.expires_at,captured_at=excluded.captured_at", (device["device_id"], ciphertext, expiry.isoformat(), iso_now()))
+        db.execute("UPDATE collector_devices SET last_seen_at=?,last_credential_at=? WHERE device_id=?", (iso_now(), iso_now(), device["device_id"]))
+    audit("credential_upload", device["device_id"], f"expires {expiry.isoformat()}")
+    return {"ok": True, "expires_at": expiry.isoformat()}
+
+
+@app.get("/api/v1/admin/collector-status")
+def admin_collector_status(_: sqlite3.Row = Depends(admin_session)) -> dict[str, Any]:
+    with connect() as db:
+        row = db.execute("SELECT d.device_id,d.name,d.last_seen_at,c.expires_at,c.captured_at FROM collector_devices d LEFT JOIN collector_credentials c ON c.device_id=d.device_id WHERE d.enabled=1 AND c.expires_at>? ORDER BY c.expires_at DESC LIMIT 1", (iso_now(),)).fetchone()
+    return {"active_credential": dict(row) if row else None}
 
 
 async def event_stream(request: Request) -> AsyncIterator[str]:
