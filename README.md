@@ -87,6 +87,28 @@ returns model URLs or keys.
 
 ## Desktop authorization refresh agent
 
+### Deploy from a fresh clone
+
+```powershell
+git clone git@github.com:970thunder/anlingshi.git
+cd anlingshi
+python -m pip install -r requirements.txt
+```
+
+Use `.env.example` as the deployment-variable checklist. Set the values in the
+host environment (or the host's secret manager), then start both long-running
+processes with the same `MATCH_DB`, `WRITE_TOKEN`, and
+`ADMIN_ENCRYPTION_KEY`:
+
+```powershell
+python -m uvicorn api.app:app --host 0.0.0.0 --port 8000
+python -m collector.server_ws_client
+```
+
+The API requires `ADMIN_USERNAME`, `ADMIN_PASSWORD`,
+`ADMIN_SESSION_SECRET`, and `ADMIN_ENCRYPTION_KEY` for `/admij`. On an HTTPS
+deployment set `ADMIN_COOKIE_SECURE=1`; use `0` only for local HTTP testing.
+
 The server can collect settlements without an always-open mini-program while a
 valid game credential exists. Run the server-side listener alongside the API:
 
